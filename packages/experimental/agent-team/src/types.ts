@@ -53,6 +53,8 @@ export interface TeamMemberSnapshot {
   readonly context: 'fresh' | 'fork'
   readonly phase: TeamMemberPhase
   readonly error?: string
+  /** Model route resolved at spawn/settlement; lets a non-live member display its own model instead of the Lead's current one. */
+  readonly model?: string
 }
 
 /** Current runtime-enriched roster row. */
