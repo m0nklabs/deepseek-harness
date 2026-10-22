@@ -136,7 +136,13 @@ export class TeamRoster {
     }]
     for (const member of state.members) {
       const live = this.ctx.agents.get(member.id)
-      const model = live?.options.model ?? root.options.model
+      // A non-live member must display its SPAWN-TIME model, not the Lead's
+      // current one: inactive teammates previously mirrored the Lead's model,
+      // which read as "this teammate runs X" when it never did (observed
+      // 2026-10-22: glm-5.3 teammates listed as glm-5.3-flash after the Lead
+      // switched). Members spawned before this field was recorded keep the
+      // old Lead-model fallback.
+      const model = live?.options.model ?? member.model ?? root.options.model
       result.push({
         id: member.id,
         name: member.name,
@@ -294,8 +300,10 @@ export class TeamRoster {
       }
       throw error
     }
+    const spawnModel = this.ctx.agents.get(childId)?.options.model
     const active = {
       ...member,
+      ...spawnModel === undefined ? {} : { model: spawnModel },
       phase: 'active' as const,
     } satisfies TeamMemberSnapshot
     // Once the continuation accepted its first prompt, it is a real child. If
@@ -406,6 +414,12 @@ export class TeamRoster {
           ...current,
           phase,
           ...phase === 'failed' ? { error: failure } : {},
+          // A restart-reconciled member reads the spawn-time model from its
+          // own durable subagent descriptor, so the roster keeps showing the
+          // member's model even when the child is not live.
+          ...(phase === 'active' && descriptor?.agentModel !== undefined)
+            ? { model: descriptor.agentModel }
+            : {},
         }
         await this.journal.appendAndFlush(root, 'team/member', {
           version: 2,
