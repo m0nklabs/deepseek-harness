@@ -47,6 +47,20 @@ export interface Config {
    * always compares the FULL canonical string).
    */
   argumentsPreviewChars?: number
+  /**
+   * Per-tool hard cap within one user-bounded run: when ONE tracked tool has
+   * been called more than N times in a row regardless of arguments, every
+   * further call's result is withheld and replaced by a hard-stop block until
+   * the user replies (which resets the counters). 0 disables the cap — the
+   * default, so the package stays advisory unless a deployment opts in.
+   * Rationale: the exact-match chain cannot see argument-rotating loops (each
+   * different-argument call resets the chain to 1); a deployment that lets a
+   * model enumerate a bounded catalog (e.g. template search) can still be
+   * consumed by such a loop (observed: one agent emitted ~70
+   * `search_templates` calls with rotating one-word queries, surviving a
+   * compaction checkpoint).
+   */
+  toolCallCap?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -54,6 +68,7 @@ export const Config: z<Config> = z.object({
   include: z.array(z.string()).default([]),
   exclude: z.array(z.string()).default([]),
   argumentsPreviewChars: z.number().default(500),
+  toolCallCap: z.number().int().min(0).default(0),
 })
 
 /**
@@ -83,6 +98,19 @@ function detailedReminder(toolName: string, count: number, canonicalArguments: s
     + 'these exact arguments again. Inspect the latest result and choose a '
     + 'different action, different arguments, or finish the task if enough '
     + 'evidence has been gathered.'
+}
+
+/**
+ * The hard-stop feedback for a per-tool cap breach. Unlike the reminders, this
+ * text rides a `block` decision: the deployment opted into enforcement.
+ */
+function hardStopNotice(toolName: string, runCount: number, cap: number): string {
+  return 'Hard per-tool call cap exceeded:\n'
+    + `- tool: ${toolName}\n`
+    + `- calls_this_run: ${runCount} (cap: ${cap})\n`
+    + 'The tool result is withheld. Do not call this tool again this run: '
+    + 'summarize what you have so far, switch to a materially different '
+    + 'approach, or finish the task. The counter resets when the user replies.'
 }
 
 /**
@@ -178,6 +206,8 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   const chains = new WeakMap<Agent, Chain>()
+  /** Per-tool call totals within one user-bounded run; reset together with the chain. */
+  const toolRuns = new WeakMap<Agent, Map<string, number>>()
 
   /** Whether a tool participates in the chain (untracked calls are transparent: they neither count nor reset). */
   function tracked(toolName: string): boolean {
@@ -193,7 +223,13 @@ export function apply(ctx: Context, config: Config): void {
    * same pipeline), and a model hammering a denied call is exactly the loop
    * worth breaking.
    */
-  function observe(exec: ToolExecution): UserMessage | undefined {
+  /** One post-execute observation: an optional reminder message, plus the hard-stop feedback text when the configured per-tool cap is exceeded. */
+  interface Observation {
+    reminder?: UserMessage
+    blockText?: string
+  }
+
+  function observe(exec: ToolExecution): Observation | undefined {
     // A direct `ctx.tools.execute()` caller has no model to remind and no id
     // to key on; only agent-loop calls participate.
     if (!exec.agent) return undefined
@@ -203,14 +239,31 @@ export function apply(ctx: Context, config: Config): void {
     const chain = chains.get(exec.agent)
     const count = chain !== undefined && chain.key === key ? chain.count + 1 : 1
     chains.set(exec.agent, { key, count })
-    if (!thresholdSet.has(count)) return undefined
+    let reminder: UserMessage | undefined
+    let blockText: string | undefined
+    if (toolCallCap > 0) {
+      const runs = toolRuns.get(exec.agent) ?? new Map<string, number>()
+      const runCount = (runs.get(exec.name) ?? 0) + 1
+      runs.set(exec.name, runCount)
+      toolRuns.set(exec.agent, runs)
+      if (runCount > toolCallCap) {
+        blockText = hardStopNotice(exec.name, runCount, toolCallCap)
+        reminder = createUserMessage({
+          content: [{ type: 'text', text: blockText }],
+          source: { ...REMINDER_SOURCE, form: 'notice', summary: `${exec.name} cap ${runCount}/${toolCallCap}` },
+        })
+        return { reminder, blockText }
+      }
+    }
+    if (!thresholdSet.has(count)) return { reminder }
     const text = count === thresholds[0]
       ? GENTLE_REMINDER
       : detailedReminder(exec.name, count, previewArguments(canonical, argumentsPreviewChars))
-    return createUserMessage({
+    reminder = createUserMessage({
       content: [{ type: 'text', text }],
       source: { ...REMINDER_SOURCE, form: 'notice', summary: `${exec.name} × ${count}` },
     })
+    return { reminder }
   }
 
   // Observe-and-enrich, never veto: count first (state advances regardless of
@@ -218,15 +271,25 @@ export function apply(ctx: Context, config: Config): void {
   // replace, then fold the reminder onto whatever came back — additionalContexts
   // rides both decision variants, so a blocked call still gets the nudge.
   ctx.on('tools/post-execute', async (exec, _result, next): Promise<PostToolDecision> => {
-    const reminder = observe(exec)
+    const observation = observe(exec)
     const downstream = await next()
-    if (!reminder) return downstream
+    if (observation === undefined || observation.reminder === undefined) return downstream
+    if (observation.blockText !== undefined) {
+      // The cap is a configured hard stop: the call already ran, so feeding
+      // the loop another near-identical result is withheld — the result is
+      // replaced by the hard-stop feedback, while an existing block (a deny)
+      // keeps its own feedback and only gains the notice.
+      if (downstream.kind === 'block') {
+        return { kind: 'block', feedback: downstream.feedback, additionalContexts: prependContext(observation.reminder, downstream.additionalContexts) }
+      }
+      return { kind: 'block', feedback: [{ type: 'text', text: observation.blockText }] }
+    }
     if (downstream.kind === 'block') {
-      return { kind: 'block', feedback: downstream.feedback, additionalContexts: prependContext(reminder, downstream.additionalContexts) }
+      return { kind: 'block', feedback: downstream.feedback, additionalContexts: prependContext(observation.reminder, downstream.additionalContexts) }
     }
     return {
       ...downstream,
-      additionalContexts: prependContext(reminder, downstream.additionalContexts),
+      additionalContexts: prependContext(observation.reminder, downstream.additionalContexts),
     }
   })
 
@@ -234,7 +297,10 @@ export function apply(ctx: Context, config: Config): void {
   // loop. Pure reset hook: always delegates (attaching nothing, vetoing
   // nothing).
   ctx.on('agent/pre-step', ({ agent, messages }, next): Promise<PreStepDecision> => {
-    if (messages.some(message => message.source.kind === 'user')) chains.delete(agent)
+    if (messages.some(message => message.source.kind === 'user')) {
+      chains.delete(agent)
+      toolRuns.delete(agent)
+    }
     return next()
   })
 }
