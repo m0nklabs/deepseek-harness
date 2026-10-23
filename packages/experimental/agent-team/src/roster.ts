@@ -15,6 +15,7 @@ import type { TeamState } from './projection.ts'
 import { messageAccepted } from './session-message.ts'
 import { TeamId } from './types.ts'
 import type {
+  RemoveTeammateResult,
   SpawnTeammateRequest,
   SpawnTeammateResult,
   TeamMemberSnapshot,
@@ -135,6 +136,7 @@ export class TeamRoster {
       diagnostics: [],
     }]
     for (const member of state.members) {
+      if (member.phase === 'removed') continue // Tombstones are journal history, not roster rows.
       const live = this.ctx.agents.get(member.id)
       const model = live?.options.model ?? root.options.model
       result.push({
@@ -198,6 +200,48 @@ export class TeamRoster {
   }
 
   /**
+   * Remove one durable teammate: stop its live child and write a tombstone.
+   * The journal keeps the full history (no silent discard); the tombstoned
+   * row keeps reserving its name, counts against no limit, and disappears
+   * from the roster and the projection wire view.
+   * @param caller - exact live Team Lead.
+   * @param targetName - durable teammate name.
+   * @returns the tombstoned member identity.
+   */
+  async remove(caller: Agent, targetName: string): Promise<RemoveTeammateResult> {
+    if (this.lifecycle.disposed) throw new TeamError('Agent Teams service is disposing', 'TEAM_DISPOSED')
+    const membership = this.membership(caller)
+    if (membership.role !== 'lead') {
+      throw new TeamError('only the Team Lead can remove teammates', 'TEAM_LEAD_REQUIRED')
+    }
+    if (targetName === 'lead') {
+      throw new TeamError('the Team Lead cannot remove itself', 'TEAM_INVALID_TARGET')
+    }
+    const state = this.journal.state(membership.root)
+    const target = state.members.find(candidate => candidate.name === targetName)
+    if (target === undefined || target.phase === 'removed') {
+      throw new TeamError(`teammate "${targetName}" not found in this Team`, 'TEAM_MEMBER_NOT_FOUND')
+    }
+    if (target.phase === 'provisioning') {
+      throw new TeamError(
+        `teammate "${targetName}" is still provisioning — removal needs a settled active or failed teammate`,
+        'TEAM_MEMBER_PROVISIONING',
+      )
+    }
+    await this.stopTeammates(membership.root, [target.id])
+    await this.journal.transact(membership.root.id, async () => {
+      const current = this.journal.state(membership.root).members.find(candidate => candidate.id === target.id)
+      if (current === undefined || current.phase === 'removed') return
+      await this.journal.appendAndFlush(membership.root, 'team/member', {
+        version: 2,
+        teamId: TeamId(membership.root.id),
+        member: { ...current, phase: 'removed' as const },
+      })
+    })
+    return { id: target.id, name: target.name }
+  }
+
+  /**
    * Group exact live roster children by their current Lead for runtime teardown.
    * @returns each live Lead and the roster child ids currently in the Agent registry.
    */
@@ -254,7 +298,7 @@ export class TeamRoster {
       if (state.members.some(member => member.name === name)) {
         throw new TeamError(`teammate name "${name}" was already used in this Team`, 'TEAM_MEMBER_NAME_TAKEN')
       }
-      if (state.members.length >= this.maxMembers) {
+      if (state.members.filter(candidate => candidate.phase !== 'removed').length >= this.maxMembers) {
         throw new TeamError(`Team member limit ${this.maxMembers} reached`, 'TEAM_MEMBER_LIMIT')
       }
       await this.journal.appendAndFlush(root, 'team/member', { version: 2, teamId: TeamId(root.id), member })

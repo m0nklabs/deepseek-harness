@@ -1466,3 +1466,86 @@ describe('Team direct messages and waiting', () => {
     })
   })
 })
+
+describe('Teammate removal', () => {
+  it('stops the live child, writes a tombstone, keeps history, and reserves the name', async () => {
+    const { ctx, lead } = await setup([])
+    const member = await spawn(ctx, lead, 'doomed')
+    await waitRunning(ctx, member.member.id)
+    const countMemberEvents = async () =>
+      (await storedEvents(ctx, lead.id)).filter(event => event.type === 'team/member').length
+    const before = await countMemberEvents()
+    await expect(ctx.agentTeams.removeTeammate(lead, 'doomed'))
+      .resolves.toEqual({ id: member.member.id, name: 'doomed' })
+    await waitNoAgent(ctx, member.member.id)
+    expect(await countMemberEvents()).toBe(before + 1)
+    const tombstone = durable(lead).members.find(candidate => candidate.name === 'doomed')
+    expect(tombstone?.phase).toBe('removed')
+    expect(ctx.agentTeams.listMembers(lead).map(row => row.name)).not.toContain('doomed')
+    await expect(spawn(ctx, lead, 'doomed')).rejects.toMatchObject({ code: 'TEAM_MEMBER_NAME_TAKEN' })
+  })
+
+  it('refuses non-Lead callers, the lead itself, unknown names, and already-removed members', async () => {
+    const { ctx, lead } = await setup([])
+    const member = await spawn(ctx, lead, 'worker')
+    await waitRunning(ctx, member.member.id)
+    await expect(ctx.agentTeams.removeTeammate(member.member.id, 'worker'))
+      .rejects.toMatchObject({ code: 'TEAM_LEAD_REQUIRED' })
+    await expect(ctx.agentTeams.removeTeammate(lead, 'lead'))
+      .rejects.toMatchObject({ code: 'TEAM_INVALID_TARGET' })
+    await expect(ctx.agentTeams.removeTeammate(lead, 'no-such-name'))
+      .rejects.toMatchObject({ code: 'TEAM_MEMBER_NOT_FOUND' })
+    await expect(ctx.agentTeams.removeTeammate(lead, 'worker'))
+      .resolves.toEqual({ id: member.member.id, name: 'worker' })
+    await expect(ctx.agentTeams.removeTeammate(lead, 'worker'))
+      .rejects.toMatchObject({ code: 'TEAM_MEMBER_NOT_FOUND' })
+    await waitNoAgent(ctx, member.member.id)
+  })
+
+  it('refuses removal while the target is still provisioning', async () => {
+    const { ctx, lead } = await setup([])
+    const journal = (ctx.agentTeams as unknown as {
+      journal: { appendAndFlush(root: Agent, type: 'team/member', data: unknown): Promise<void> }
+    }).journal
+    const provisioning: TeamMemberSnapshot = {
+      id: SessionId('00000000-0000-4000-8000-0000000000c0'),
+      name: 'still-provisioning',
+      description: 'creation in flight',
+      provider: 'spawn',
+      context: 'fresh',
+      phase: 'provisioning',
+    }
+    await journal.appendAndFlush(lead, 'team/member', {
+      version: 2,
+      teamId: TeamId(lead.id),
+      member: provisioning,
+    })
+    await expect(ctx.agentTeams.removeTeammate(lead, 'still-provisioning'))
+      .rejects.toMatchObject({ code: 'TEAM_MEMBER_PROVISIONING' })
+    expect(durable(lead).members.find(candidate => candidate.name === 'still-provisioning')?.phase)
+      .toBe('provisioning')
+  })
+
+  it('frees the member-limit slot: removed members do not count', async () => {
+    const { ctx, lead } = await setup([], { maxMembers: 1 })
+    const first = await spawn(ctx, lead, 'one')
+    await waitRunning(ctx, first.member.id)
+    await expect(spawn(ctx, lead, 'two')).rejects.toMatchObject({ code: 'TEAM_MEMBER_LIMIT' })
+    await ctx.agentTeams.removeTeammate(lead, 'one')
+    await expect(spawn(ctx, lead, 'two')).resolves.toMatchObject({ member: { name: 'two' } })
+    await waitNoAgent(ctx, first.member.id)
+  })
+
+  it('filters removed members from the live roster and the projection wire view', async () => {
+    const { ctx, lead } = await setup([])
+    const member = await spawn(ctx, lead, 'ghost')
+    await waitRunning(ctx, member.member.id)
+    await ctx.agentTeams.removeTeammate(lead, 'ghost')
+    let projected = teamProjectionDefinition.init(lead.session.header)
+    for (const event of lead.session.snapshotEvents()) projected = teamProjectionDefinition.apply(projected, event)
+    expect(projected.members.find(candidate => candidate.name === 'ghost')?.phase).toBe('removed')
+    const wire = teamProjectionDefinition.wire.view(projected)
+    expect(wire.members.map(row => row.name)).not.toContain('ghost')
+    expect(ctx.agentTeams.listMembers(lead).map(row => row.name)).not.toContain('ghost')
+  })
+})

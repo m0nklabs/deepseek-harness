@@ -70,7 +70,7 @@ const teamMemberSnapshotSchema = z.object({
   description: z.string(),
   provider: z.string(),
   context: z.enum(['fresh', 'fork']),
-  phase: z.enum(['provisioning', 'active', 'failed']),
+  phase: z.enum(['provisioning', 'active', 'failed', 'removed']),
   error: z.string().optional(),
 }).strict() as z.ZodType<TeamMemberSnapshot>
 
@@ -261,7 +261,10 @@ function applyCurrentTeamEvent(state: TeamProjectionState, event: TeamSessionEve
         if (prior.name !== member.name || prior.provider !== member.provider || prior.context !== member.context) {
           throw new Error(`teammate "${member.id}" changed immutable identity fields`)
         }
-        if (prior.phase !== 'provisioning' || member.phase === 'provisioning') {
+        const removal = member.phase === 'removed'
+        if (removal
+          ? (prior.phase !== 'active' && prior.phase !== 'failed')
+          : (prior.phase !== 'provisioning' || member.phase === 'provisioning')) {
           throw new Error(`teammate "${member.name}" has an invalid ${prior.phase} -> ${member.phase} transition`)
         }
       }
@@ -343,6 +346,7 @@ function buildTeamProjection(state: TeamProjectionState): TeamProjection {
   const rootId = brandString<SessionId>(state.id)
   const members: TeamMemberProjection[] = [{ id: rootId, name: 'lead', role: 'lead', phase: 'active' }]
   for (const member of state.members) {
+    if (member.phase === 'removed') continue // Tombstones stay in the journal, never in the wire view.
     members.push({
       id: member.id,
       name: member.name,
@@ -386,7 +390,7 @@ export function teamProjectionView(state: TeamProjectionState): TeamProjection {
 /** Team projection selected by the projected Session identity; the wire view carries durable roster and task state only. */
 export const teamProjectionDefinition = {
   key: 'agentTeam',
-  stateVersion: 4,
+  stateVersion: 5,
   stateSchema: teamProjectionEntrySchema,
   init: header => emptyTeamState(header.id),
   apply: applyProjectionEvent,

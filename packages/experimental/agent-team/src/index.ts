@@ -18,6 +18,7 @@ import { TeamId, TeamTaskId } from './types.ts'
 import type {
   Config,
   CreateTeamTaskRequest,
+  RemoveTeammateResult,
   SendTeamMessageRequest,
   SendTeamMessageResult,
   SpawnTeammateRequest,
@@ -134,6 +135,17 @@ export class TeamService extends Service {
    */
   async spawnTeammate(caller: Agent, request: SpawnTeammateRequest): Promise<SpawnTeammateResult> {
     return await this.roster.spawn(caller, request)
+  }
+
+  /**
+   * Remove one durable teammate: stop its live child and write a tombstone.
+   * @param caller - exact live Team Lead.
+   * @param name - durable teammate name.
+   * @returns the tombstoned member identity; the journal keeps the history.
+   */
+  async removeTeammate(caller: Agent, name: string): Promise<RemoveTeammateResult> {
+    if (this.lifecycle.disposed) throw new TeamError('Agent Teams service is disposing', 'TEAM_DISPOSED')
+    return await this.roster.remove(caller, name)
   }
 
   /**

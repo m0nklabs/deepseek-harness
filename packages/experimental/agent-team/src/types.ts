@@ -41,8 +41,8 @@ export function TeamMessageId(id: string): TeamMessageId {
   return id as TeamMessageId
 }
 
-/** Durable teammate lifecycle. */
-export type TeamMemberPhase = 'provisioning' | 'active' | 'failed'
+/** Durable teammate lifecycle. `removed` is a tombstone: the row stays in the journal for auditability, counts against nothing, and reserves its name. */
+export type TeamMemberPhase = 'provisioning' | 'active' | 'failed' | 'removed'
 
 /** Whole durable value written on every teammate lifecycle change. */
 export interface TeamMemberSnapshot {
@@ -159,6 +159,12 @@ export interface Config {
   readonly maxMessageBytes?: number
   /** Maximum milliseconds for shared operation settlement and for each Team child drain. */
   readonly disposalTimeoutMs?: number
+}
+
+/** Result after one teammate was removed: the tombstone identity. */
+export interface RemoveTeammateResult {
+  readonly id: SessionId
+  readonly name: string
 }
 
 /** Input for creating one durable teammate. */
