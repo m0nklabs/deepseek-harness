@@ -38,6 +38,7 @@ function runtimeContextText(request: GenerateOptions) {
 const SIGNAL = new AbortController().signal
 const TOOL_NAMES = [
   'spawn_teammate',
+  'remove_member',
   'send_message',
   'list_agents',
   'wait_agent',
@@ -555,6 +556,31 @@ describe('dsh-tool-team', () => {
     expect(childInterrupt.isError).toBe(true)
     await execute(ctx, lead, 'interrupt_agent', { target: 'json-worker' })
     await vi.waitFor(() => { expect(ctx.agents.get(childId)).toBeUndefined() }, { timeout: 5_000 })
+  })
+
+  it('adapts Lead-only removal to the domain tombstone and keeps the journal authoritative', async () => {
+    const { ctx, lead } = await setup(['hang', 'hang'])
+    const spawned = await execute(ctx, lead, 'spawn_teammate', {
+      name: 'doomed-worker', description: 'doomed worker', prompt: 'wait', context: 'fresh',
+    })
+    const childId = spawnedChildId(ctx, lead, spawned)
+    const child = await waitRunning(ctx, childId)
+
+    const denied = await execute(ctx, child, 'remove_member', { name: 'doomed-worker' })
+    expect(denied.isError).toBe(true)
+    expect(text(denied)).toContain('only the Team Lead can remove teammates')
+
+    const removed = await execute(ctx, lead, 'remove_member', { name: 'doomed-worker' })
+    expect(removed.isError).toBe(false)
+    expect(JSON.parse(text(removed))).toEqual({ removed: true, id: childId, name: 'doomed-worker' })
+    await vi.waitFor(() => { expect(ctx.agents.get(childId)).toBeUndefined() }, { timeout: 5_000 })
+    const roster = await execute(ctx, lead, 'list_agents', {})
+    expect(JSON.parse(text(roster))).toEqual([
+      { target: 'lead', role: 'lead', status: 'running', model: 'mock', diagnostics: [] },
+    ])
+    const again = await execute(ctx, lead, 'remove_member', { name: 'doomed-worker' })
+    expect(again.isError).toBe(true)
+    expect(text(again)).toContain('not found in this Team')
   })
 
   it('adapts optional task filters, mutations, pagination, and default waiting', async () => {

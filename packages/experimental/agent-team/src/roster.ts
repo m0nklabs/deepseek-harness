@@ -22,8 +22,23 @@ import type {
   TeamMemberView,
 } from './types.ts'
 import { requiredText } from './validation.ts'
+import type { LiveTeamMemberPhase } from './types.ts'
 
 const MEMBER_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
+
+/** One admitted delivery to a teammate target, released by the sender after settlement. */
+export interface TeamDeliveryAdmission {
+  /** Resolves when the admitted send is released. */
+  readonly released: Promise<void>
+  /** Release the admission; safe to call more than once. */
+  release(): void
+}
+
+/** Delivery admission state for one teammate target. */
+interface DeliveryGate {
+  closed: boolean
+  readonly pending: Set<Promise<void>>
+}
 
 /** Caller identity inside one implicit Team. */
 export interface TeamMembership {
@@ -68,6 +83,41 @@ export class TeamRoster {
     private readonly lifecycle: TeamRuntimeLifecycle,
     private readonly maxMembers: number,
   ) {}
+
+  private readonly deliveries = new Map<SessionId, DeliveryGate>()
+
+  /**
+   * Resolve one active target and admit its delivery, or reject a target whose removal already
+   * closed admission. Resolving and registering are synchronous, so a send admitted before
+   * `remove()` closed the gate is always counted by it. The Lead target resolves without a gate.
+   * @param root - exact live Team Lead.
+   * @param targetName - durable member name.
+   * @returns the resolved target and the release handle for the admitted delivery.
+   */
+  admitDelivery(root: Agent, targetName: string): { id: SessionId; name: string } & TeamDeliveryAdmission {
+    const target = resolveActiveMember(root, this.journal.state(root), targetName)
+    if (target.id === root.id) {
+      return { ...target, released: Promise.resolve(), release: () => undefined }
+    }
+    let gate = this.deliveries.get(target.id)
+    if (gate === undefined) {
+      gate = { closed: false, pending: new Set() }
+      this.deliveries.set(target.id, gate)
+    }
+    if (gate.closed) {
+      throw new TeamError(`active teammate "${targetName}" not found`, 'TEAM_MEMBER_NOT_FOUND')
+    }
+    const released = Promise.withResolvers<void>()
+    const entry = released.promise
+    gate.pending.add(entry)
+    return {
+      ...target,
+      released: entry,
+      release: () => {
+        if (gate.pending.delete(entry)) released.resolve()
+      },
+    }
+  }
 
   /**
    * Resolve one exact live Agent's Team role.
@@ -228,6 +278,10 @@ export class TeamRoster {
         'TEAM_MEMBER_PROVISIONING',
       )
     }
+    // Close this teammate's delivery admission before draining it: an admitted send parked on a
+    // cold resume must settle (or fail) before the tombstone, or it would materialize a live
+    // child that the roster no longer publishes.
+    await this.closeDelivery(target.id)
     await this.stopTeammates(membership.root, [target.id])
     await this.journal.transact(membership.root.id, async () => {
       const current = this.journal.state(membership.root).members.find(candidate => candidate.id === target.id)
@@ -363,6 +417,15 @@ export class TeamRoster {
     return { member: this.memberView(active) }
   }
 
+  /** Close delivery admission for one teammate and wait for its admitted sends to release. */
+  private async closeDelivery(targetId: SessionId): Promise<void> {
+    const gate = this.deliveries.get(targetId)
+    if (gate === undefined) return
+    gate.closed = true
+    await Promise.allSettled(gate.pending)
+    this.deliveries.delete(targetId)
+  }
+
   /** Flush the accepted initial inbox item before the Lead can commit `active`. */
   private async checkpointInitialPrompt(
     childId: SessionId,
@@ -487,16 +550,22 @@ export class TeamRoster {
     return value
   }
 
-  /** Append one terminal provisioning edge unless recovery already settled it. */
+  /** Append one terminal provisioning edge unless recovery already settled or removed it. */
   private async settleProvisioning(
     root: Agent,
     terminal: TeamMemberSnapshot,
-  ): Promise<'active' | 'failed'> {
+  ): Promise<LiveTeamMemberPhase> {
     return this.journal.transact(root.id, async () => {
       const current = this.journal.state(root).members.find(member => member.id === terminal.id)
       /* v8 ignore next 3 -- the append-only provisioning event is committed by this operation before settlement. */
       if (current === undefined) {
         throw new TeamError(`provisioned teammate "${terminal.id}" disappeared`, 'TEAM_PROVISIONING_CONFLICT')
+      }
+      if (current.phase === 'removed') {
+        throw new TeamError(
+          `provisioned teammate "${current.name}" was already removed`,
+          'TEAM_PROVISIONING_CONFLICT',
+        )
       }
       if (current.phase !== 'provisioning') return current.phase
       await this.journal.appendAndFlush(root, 'team/member', {

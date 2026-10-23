@@ -11,7 +11,7 @@ import { errorMessage, TeamError } from './error.ts'
 import { TeamJournal } from './journal.ts'
 import { TeamRuntimeLifecycle } from './lifecycle.ts'
 import { teamProjectionDefinition } from './projection.ts'
-import { resolveActiveMember, TeamRoster } from './roster.ts'
+import { TeamRoster } from './roster.ts'
 import type { TeamMembership } from './roster.ts'
 import { TeamTaskBoard } from './task-board.ts'
 import { TeamId, TeamTaskId } from './types.ts'
@@ -145,7 +145,9 @@ export class TeamService extends Service {
    */
   async removeTeammate(caller: Agent, name: string): Promise<RemoveTeammateResult> {
     if (this.lifecycle.disposed) throw new TeamError('Agent Teams service is disposing', 'TEAM_DISPOSED')
-    return await this.roster.remove(caller, name)
+    // The complete removal — final journal transaction included — is tracked like creation and
+    // sending, so runtime disposal waits for it instead of unregistering the projection first.
+    return await this.lifecycle.track(this.roster.remove(caller, name))
   }
 
   /**
@@ -237,26 +239,32 @@ export class TeamService extends Service {
     const membership = this.roster.membership(caller)
     request.signal.throwIfAborted()
     const { root } = membership
-    const target = resolveActiveMember(root, this.journal.state(root), request.target)
-    if (target.id === caller.id) throw new TeamError('a Team member cannot message itself', 'TEAM_SELF_MESSAGE')
-    const content = [
-      { type: 'text' as const, text: `Team message from ${membership.name}:` },
-      ...structuredClone(request.content),
-    ]
-    if (Buffer.byteLength(JSON.stringify(content), 'utf8') > this.config.maxMessageBytes) {
-      throw new TeamError(`team message exceeds ${this.config.maxMessageBytes} bytes`, 'TEAM_MESSAGE_TOO_LARGE')
+    // Admission resolves the target and registers the delivery against concurrent removal in one
+    // synchronous step; a target whose removal already closed admission rejects here.
+    const target = this.roster.admitDelivery(root, request.target)
+    try {
+      if (target.id === caller.id) throw new TeamError('a Team member cannot message itself', 'TEAM_SELF_MESSAGE')
+      const content = [
+        { type: 'text' as const, text: `Team message from ${membership.name}:` },
+        ...structuredClone(request.content),
+      ]
+      if (Buffer.byteLength(JSON.stringify(content), 'utf8') > this.config.maxMessageBytes) {
+        throw new TeamError(`team message exceeds ${this.config.maxMessageBytes} bytes`, 'TEAM_MESSAGE_TOO_LARGE')
+      }
+      const source = { kind: 'agent-message' as const, form: 'relay' as const, senderSessionId: caller.id }
+      let messageId
+      if (target.id === root.id) {
+        const input = createUserMessage({ content, source })
+        root.steer(input)
+        messageId = input.id
+      } else {
+        messageId = await steerHostSubagentPrompt(this.ctx.subagents, root, target.id, content, source, request.signal)
+      }
+      this.activity.notify(membership.id)
+      return { messageId }
+    } finally {
+      target.release()
     }
-    const source = { kind: 'agent-message' as const, form: 'relay' as const, senderSessionId: caller.id }
-    let messageId
-    if (target.id === root.id) {
-      const input = createUserMessage({ content, source })
-      root.steer(input)
-      messageId = input.id
-    } else {
-      messageId = await steerHostSubagentPrompt(this.ctx.subagents, root, target.id, content, source, request.signal)
-    }
-    this.activity.notify(membership.id)
-    return { messageId }
   }
 
   /** Queue one contained provisioning reconciliation after publication has unwound. */

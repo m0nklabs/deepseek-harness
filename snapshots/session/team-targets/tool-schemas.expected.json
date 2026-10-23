@@ -292,6 +292,22 @@
       }
     },
     {
+      "name": "remove_member",
+      "description": "Remove one durable teammate: stops its live child and writes a tombstone in the Team journal. History stays auditable, the name stays reserved, the member-limit slot frees, owned tasks are untouched (reassign them if needed). Only the Team Lead may call this tool. Refuses teammates that are still provisioning.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Teammate name returned by list_agents (not \"lead\")."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
       "name": "send_message",
       "description": "Send one message to another Team member. A running target receives it at the nearest step boundary; an inactive target starts or resumes a turn.",
       "parameters": {

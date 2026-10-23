@@ -93,9 +93,13 @@ interface TeamServiceInternals {
     reconcileProvisioning(root: Agent, signal: AbortSignal): Promise<void>
     recoverFor(agent: Agent, signal: AbortSignal): Promise<void>
     liveChildrenByRoot(): Map<Agent, SessionId[]>
+    settleProvisioning(root: Agent, terminal: TeamMemberSnapshot): Promise<'active' | 'failed'>
+    admitDelivery(root: Agent, targetName: string): { id: SessionId; name: string; release(): void }
+    remove(caller: Agent, targetName: string): Promise<{ id: SessionId; name: string }>
   }
   readonly journal: {
     state(root: Agent): unknown
+    appendAndFlush(root: Agent, type: 'team/member', data: unknown): Promise<unknown>
   }
   disposeRuntime(): Promise<void>
   scheduleRecovery(agent: Agent): void
@@ -1469,7 +1473,7 @@ describe('Team direct messages and waiting', () => {
 
 describe('Teammate removal', () => {
   it('stops the live child, writes a tombstone, keeps history, and reserves the name', async () => {
-    const { ctx, lead } = await setup([])
+    const { ctx, lead } = await setup(['hang'])
     const member = await spawn(ctx, lead, 'doomed')
     await waitRunning(ctx, member.member.id)
     const countMemberEvents = async () =>
@@ -1486,10 +1490,10 @@ describe('Teammate removal', () => {
   })
 
   it('refuses non-Lead callers, the lead itself, unknown names, and already-removed members', async () => {
-    const { ctx, lead } = await setup([])
+    const { ctx, lead } = await setup(['hang'])
     const member = await spawn(ctx, lead, 'worker')
-    await waitRunning(ctx, member.member.id)
-    await expect(ctx.agentTeams.removeTeammate(member.member.id, 'worker'))
+    const worker = await waitRunning(ctx, member.member.id)
+    await expect(ctx.agentTeams.removeTeammate(worker, 'worker'))
       .rejects.toMatchObject({ code: 'TEAM_LEAD_REQUIRED' })
     await expect(ctx.agentTeams.removeTeammate(lead, 'lead'))
       .rejects.toMatchObject({ code: 'TEAM_INVALID_TARGET' })
@@ -1527,7 +1531,7 @@ describe('Teammate removal', () => {
   })
 
   it('frees the member-limit slot: removed members do not count', async () => {
-    const { ctx, lead } = await setup([], { maxMembers: 1 })
+    const { ctx, lead } = await setup(['hang', 'hang'], { maxMembers: 1 })
     const first = await spawn(ctx, lead, 'one')
     await waitRunning(ctx, first.member.id)
     await expect(spawn(ctx, lead, 'two')).rejects.toMatchObject({ code: 'TEAM_MEMBER_LIMIT' })
@@ -1537,7 +1541,7 @@ describe('Teammate removal', () => {
   })
 
   it('filters removed members from the live roster and the projection wire view', async () => {
-    const { ctx, lead } = await setup([])
+    const { ctx, lead } = await setup(['hang'])
     const member = await spawn(ctx, lead, 'ghost')
     await waitRunning(ctx, member.member.id)
     await ctx.agentTeams.removeTeammate(lead, 'ghost')
@@ -1547,5 +1551,138 @@ describe('Teammate removal', () => {
     const wire = teamProjectionDefinition.wire.view(projected)
     expect(wire.members.map(row => row.name)).not.toContain('ghost')
     expect(ctx.agentTeams.listMembers(lead).map(row => row.name)).not.toContain('ghost')
+  })
+
+  it('waits for a paused removal transaction before releasing runtime resources on unload', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const member = await spawn(ctx, lead, 'doomed')
+    await waitRunning(ctx, member.member.id)
+    const internals = teamInternals(ctx)
+    const appendAndFlush = internals.journal.appendAndFlush.bind(internals.journal)
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    vi.spyOn(internals.journal, 'appendAndFlush').mockImplementation(async (root, type, data) => {
+      const tombstone = data as { member?: { phase?: string } }
+      if (type === 'team/member' && tombstone.member?.phase === 'removed') {
+        entered.resolve(undefined)
+        await release.promise
+      }
+      return await appendAndFlush(root, type, data)
+    })
+    const removing = ctx.agentTeams.removeTeammate(lead, 'doomed')
+    let settled = false
+    void removing.then(() => { settled = true }, () => { settled = true })
+    await entered.promise
+    let unloaded = false
+    const unloading = ctx.fiber.dispose().then(() => { unloaded = true })
+    await new Promise(resolve => setImmediate(resolve))
+    expect(settled).toBe(false)
+    expect(unloaded).toBe(false)
+    release.resolve(undefined)
+    await unloading
+    await removing
+    expect(durable(lead).members.find(candidate => candidate.name === 'doomed')?.phase).toBe('removed')
+    expect(ctx.get('agentTeams')).toBeUndefined()
+  })
+
+  it('settles a paused cold send before removal and rejects later sends to the tombstone', async () => {
+    const { ctx, lead } = await setup([textResponse('done')])
+    const member = await spawn(ctx, lead, 'parked')
+    await waitNoAgent(ctx, member.member.id)
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    vi.spyOn(hostDeliverer(ctx), deliverSubagentPrompt).mockImplementation(async () => {
+      entered.resolve(undefined)
+      await release.promise
+      throw new Error('cold materialization refused')
+    })
+    const sending = ctx.agentTeams.sendMessage(lead, { target: 'parked', content: content('wake'), signal: SIGNAL })
+    const rejected = expect(sending).rejects.toThrow('cold materialization refused')
+    await entered.promise
+    const removing = ctx.agentTeams.removeTeammate(lead, 'parked')
+    let settled = false
+    void removing.then(() => { settled = true }, () => { settled = true })
+    await new Promise(resolve => setImmediate(resolve))
+    expect(settled).toBe(false)
+    // Removal closed this target's admission: a send admitted now resolves to the tombstone behavior.
+    await expect(ctx.agentTeams.sendMessage(lead, { target: 'parked', content: content('second'), signal: SIGNAL }))
+      .rejects.toMatchObject({ code: 'TEAM_MEMBER_NOT_FOUND' })
+    release.resolve(undefined)
+    await rejected
+    expect(await removing).toEqual({ id: member.member.id, name: 'parked' })
+    await waitNoAgent(ctx, member.member.id)
+    expect(durable(lead).members.find(candidate => candidate.name === 'parked')?.phase).toBe('removed')
+    await expect(ctx.agentTeams.sendMessage(lead, { target: 'parked', content: content('late'), signal: SIGNAL }))
+      .rejects.toMatchObject({ code: 'TEAM_MEMBER_NOT_FOUND' })
+    await teamInternals(ctx).disposeRuntime()
+    await expect(ctx.agentTeams.removeTeammate(lead, 'parked'))
+      .rejects.toMatchObject({ code: 'TEAM_DISPOSED' })
+  })
+
+  it('rejects provisioning settlement for a member recovery already removed', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const member = await spawn(ctx, lead, 'doomed')
+    await waitRunning(ctx, member.member.id)
+    await ctx.agentTeams.removeTeammate(lead, 'doomed')
+    await expect(teamInternals(ctx).roster.settleProvisioning(lead, {
+      id: member.member.id,
+      name: 'doomed',
+      description: 'doomed responsibility',
+      provider: 'spawn',
+      context: 'fresh',
+      phase: 'active',
+    })).rejects.toMatchObject({ code: 'TEAM_PROVISIONING_CONFLICT' })
+  })
+
+  it('removes a failed teammate so the projection accepts failed -> removed', async () => {
+    const { ctx, lead } = await setup([])
+    const journal = (ctx.agentTeams as unknown as {
+      journal: { appendAndFlush(root: Agent, type: 'team/member', data: unknown): Promise<void> }
+    }).journal
+    const failed: TeamMemberSnapshot = {
+      id: SessionId('00000000-0000-4000-8000-0000000000c1'),
+      name: 'flaky',
+      description: 'failed creation',
+      provider: 'spawn',
+      context: 'fresh',
+      phase: 'provisioning',
+    }
+    await journal.appendAndFlush(lead, 'team/member', {
+      version: 2, teamId: TeamId(lead.id), member: failed,
+    })
+    await journal.appendAndFlush(lead, 'team/member', {
+      version: 2, teamId: TeamId(lead.id),
+      member: { ...failed, phase: 'failed' as const, error: 'provider unavailable' },
+    })
+    await expect(ctx.agentTeams.removeTeammate(lead, 'flaky'))
+      .resolves.toEqual({ id: failed.id, name: 'flaky' })
+    expect(durable(lead).members.find(candidate => candidate.name === 'flaky')?.phase).toBe('removed')
+  })
+
+  it('resolves a concurrent duplicate removal from the tombstone re-check and rejects removal after disposal', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const member = await spawn(ctx, lead, 'doomed')
+    await waitRunning(ctx, member.member.id)
+    const [first, second] = await Promise.all([
+      ctx.agentTeams.removeTeammate(lead, 'doomed'),
+      ctx.agentTeams.removeTeammate(lead, 'doomed'),
+    ])
+    expect(first).toEqual({ id: member.member.id, name: 'doomed' })
+    expect(second).toEqual(first)
+    await waitNoAgent(ctx, member.member.id)
+
+    const internals = teamInternals(ctx)
+    await internals.disposeRuntime()
+    await expect(internals.roster.remove(lead, 'doomed'))
+      .rejects.toMatchObject({ code: 'TEAM_DISPOSED' })
+  })
+
+  it('treats a repeated delivery release as one no-op', async () => {
+    const { ctx, lead } = await setup(['hang'])
+    const member = await spawn(ctx, lead, 'target')
+    await waitRunning(ctx, member.member.id)
+    const admission = teamInternals(ctx).roster.admitDelivery(lead, 'target')
+    admission.release()
+    expect(() => { admission.release() }).not.toThrow()
   })
 })

@@ -41,8 +41,14 @@ export function TeamMessageId(id: string): TeamMessageId {
   return id as TeamMessageId
 }
 
-/** Durable teammate lifecycle. `removed` is a tombstone: the row stays in the journal for auditability, counts against nothing, and reserves its name. */
+/**
+ * Durable teammate lifecycle. `removed` is a tombstone: the row stays in the journal for
+ * auditability, counts against nothing, and reserves its name.
+ */
 export type TeamMemberPhase = 'provisioning' | 'active' | 'failed' | 'removed'
+
+/** Phases a member carries while it is still published; tombstones stay journal history. */
+export type LiveTeamMemberPhase = Exclude<TeamMemberPhase, 'removed'>
 
 /** Whole durable value written on every teammate lifecycle change. */
 export interface TeamMemberSnapshot {
@@ -102,8 +108,8 @@ export interface TeamMemberProjection {
   readonly id: SessionId
   readonly name: string
   readonly role: 'lead' | 'teammate'
-  /** Durable lifecycle; the Lead row is always `active`. Turn activity comes from Session status. */
-  readonly phase: TeamMemberPhase
+  /** Live lifecycle; the wire view filters tombstones and the Lead row is always `active`. Turn activity comes from Session status. */
+  readonly phase: LiveTeamMemberPhase
   readonly error?: string
 }
 
