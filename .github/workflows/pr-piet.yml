@@ -1,0 +1,32 @@
+# PR-Piet caller voor deepseek-harness (geinstalleerd door de pr-piet agent,
+# 2026-10-24 — same org-level reviewer stack als de overige m0nklabs-repos).
+name: PR-Piet
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: >-
+    pr-piet-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name }}${{ github.event_name == 'issue_comment' && !startsWith(github.event.comment.body, '/') && format('-nc-{0}', github.event.comment.id) || '' }}
+  cancel-in-progress: true
+
+jobs:
+  pr-piet:
+    if: ${{ github.event.sender.type != 'Bot' }}
+    uses: m0nklabs/pr-piet/.github/workflows/reusable-pr-piet.yml@main
+    with:
+      pr_number: ${{ github.event.pull_request.number || github.event.issue.number }}
+      base_branch: ${{ github.event.pull_request.base.ref || '' }}
+      enable_tier2: false
+      auto_describe: true
+      auto_improve: true
+      single_call_review: true
+      response_language: en-US
