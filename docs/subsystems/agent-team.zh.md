@@ -21,7 +21,7 @@ interface TeamMemberSnapshot {
 }
 ```
 
-每个 member 都从 `provisioning` 开始，并且只到达一个终态 roster phase：`active` 或 `failed`。roster 的 `running`／`inactive` 状态单独派生，绝不会重写该记录。
+每个 member 都从 `provisioning` 开始，并且只到达一个终态 roster phase：`active` 或 `failed`。Lead 之后可以从 `active` 或 `failed` 追加一条 `removed` tombstone：该行留在日志中以便审计、保留其名字、不占用成员上限，并且绝不会重新进入已发布 phase。roster 的 `running`／`inactive` 状态单独派生，绝不会重写该记录。
 
 ## 消息与历史 mailbox
 
@@ -85,8 +85,8 @@ interface TeamMemberProjection {
   readonly id: SessionId
   readonly name: string
   readonly role: 'lead' | 'teammate'
-  /** Durable lifecycle; the Lead row is always `active`. Turn activity comes from Session status. */
-  readonly phase: TeamMemberPhase
+  /** Live lifecycle; the wire view filters tombstones and the Lead row is always `active`. Turn activity comes from Session status. */
+  readonly phase: LiveTeamMemberPhase
   readonly error?: string
 }
 ```
@@ -160,6 +160,14 @@ listMembers(agent: Agent): TeamMemberView[]
  * @returns the active roster row.
  */
 async spawnTeammate(caller: Agent, request: SpawnTeammateRequest): Promise<SpawnTeammateResult>
+
+/**
+ * Remove one durable teammate: stop its live child and write a tombstone.
+ * @param caller - exact live Team Lead.
+ * @param name - durable teammate name.
+ * @returns the tombstoned member identity; the journal keeps the history.
+ */
+async removeTeammate(caller: Agent, name: string): Promise<RemoveTeammateResult>
 
 /**
  * Steer one peer message into the target inbox or reject the attempt.

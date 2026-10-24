@@ -98,6 +98,16 @@ const SPAWN_VALUE_SCHEMA = {
 
 const MEMBER_LIST_VALUE_SCHEMA = { type: 'array', items: MEMBER_VIEW_SCHEMA } as const
 
+const REMOVE_VALUE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    removed: { type: 'boolean', required: true },
+    id: { type: 'string', required: true },
+    name: { type: 'string', required: true },
+  },
+} as const
+
 const SEND_VALUE_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -215,6 +225,19 @@ To message another teammate, use send_message({ target: "<teammate name>", messa
           signal: exec.signal,
         })
         return { member: modelMember(result.member) }
+      },
+    })))
+
+    register(scoped.tools.register(defineTool({
+      name: 'remove_member',
+      description: 'Remove one durable teammate: stops its live child and writes a tombstone in the Team journal. History stays auditable, the name stays reserved, the member-limit slot frees, owned tasks are untouched (reassign them if needed). Only the Team Lead may call this tool. Refuses teammates that are still provisioning.',
+      parameters: {
+        name: { type: 'string', required: true, description: 'Teammate name returned by list_agents (not "lead").' },
+      },
+      output: jsonOutput(REMOVE_VALUE_SCHEMA),
+      async execute(args, exec) {
+        const result = await ctx.agentTeams.removeTeammate(callingAgent(exec.agent, 'remove_member'), args.name)
+        return { removed: true, id: result.id, name: result.name }
       },
     })))
 

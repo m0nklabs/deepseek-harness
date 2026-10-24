@@ -21,7 +21,7 @@ interface TeamMemberSnapshot {
 }
 ```
 
-Every member starts in `provisioning` and reaches exactly one terminal roster phase, `active` or `failed`. Roster `running`/`inactive` status is derived separately and never rewrites this record.
+Every member starts in `provisioning` and reaches exactly one terminal roster phase, `active` or `failed`. A Lead may afterwards append one `removed` tombstone from `active` or `failed`: the row stays in the journal for auditability, reserves its name, counts against no member limit, and never re-enters a published phase. Roster `running`/`inactive` status is derived separately and never rewrites this record.
 
 ## Messages and historical mailbox
 
@@ -85,8 +85,8 @@ interface TeamMemberProjection {
   readonly id: SessionId
   readonly name: string
   readonly role: 'lead' | 'teammate'
-  /** Durable lifecycle; the Lead row is always `active`. Turn activity comes from Session status. */
-  readonly phase: TeamMemberPhase
+  /** Live lifecycle; the wire view filters tombstones and the Lead row is always `active`. Turn activity comes from Session status. */
+  readonly phase: LiveTeamMemberPhase
   readonly error?: string
 }
 ```
@@ -160,6 +160,14 @@ listMembers(agent: Agent): TeamMemberView[]
  * @returns the active roster row.
  */
 async spawnTeammate(caller: Agent, request: SpawnTeammateRequest): Promise<SpawnTeammateResult>
+
+/**
+ * Remove one durable teammate: stop its live child and write a tombstone.
+ * @param caller - exact live Team Lead.
+ * @param name - durable teammate name.
+ * @returns the tombstoned member identity; the journal keeps the history.
+ */
+async removeTeammate(caller: Agent, name: string): Promise<RemoveTeammateResult>
 
 /**
  * Steer one peer message into the target inbox or reject the attempt.
