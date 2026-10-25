@@ -30,3 +30,5 @@ jobs:
       auto_improve: true
       single_call_review: true
       response_language: en-US
+    secrets:
+      GUARDIAN_API_KEY: ${{ secrets.GUARDIAN_API_KEY }}
