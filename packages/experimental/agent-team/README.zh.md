@@ -125,6 +125,8 @@ Lead 可以停止 teammate 的当前轮次，而不会删除其排队的消息�
 
 每个普通运行时 root 都是一个隐式 Team 的 Lead，其 `TeamId` 等于 `SessionId`；不存在创建事件，持久 Team 状态从第一条成员或任务记录开始。`spawnTeammate()` 先追加并 flush 一条 `provisioning` 成员记录，再要求配置的提供方创建预留 child；提供方失败会追加一条持久的 `failed` 成员。fresh child 不携带 Lead 历史；fork child 只捕获一次 Lead 的已完成 turn 前缀。恢复把未终结的 provisioning 记录对照 child 独立持久化的会话进行对账：直接 parent 与 continuable descriptor 匹配、且初始用户消息已记录则产生 `active`，其他任何情况都产生 `failed`。如果恢复在同进程竞争中先完成，creator 会接受终态，或报告 `TEAM_PROVISIONING_CONFLICT` 并 drain 该 child。名字由第一条 provisioning 记录保留，且永不复用。
 
+`removeTeammate()` 移除一名已定型（`active` 或 `failed`）的 teammate：它先关闭该 teammate 的投递准许，让进行中的发送在写入 tombstone 前落定，再排空活跃 child，并以常规版本 2 成员记录追加 `removed` tombstone。日志保留完整历史，名字保持保留，该行不再计入上限；Lead 本身、未知名字以及仍在 provisioning 的成员都会被拒绝。移除与创建和发送一样受运行时追踪，因此服务 dispose 会等待其最终的日志事务。
+
 ### 直接消息与历史兼容
 
 `sendMessage()` 检查确切调用方的成员身份，拒绝自发消息，并限制包含发送者前缀的完整 UTF-8 内容大小。它返回现有 inbox 身份，并仅在接收后发出 Team activity。目标保存带真实 `senderSessionId` 的 `agent-message` source；首个内容块为 `Team message from <name>:`。这些发送不写入新的 `team/message/queued` 或 `team/message/delivered` 记录。Team 不额外保证同目标发送顺序；投递顺序由目标 inbox 管理。客户端使用普通 Agent 消息标题和图标展示这些消息；正文保留发送者名称。
@@ -202,7 +204,7 @@ Peer 消息追加在 target 可复用历史前缀之后。冷恢复会先复用�
 - **实验原型，无稳定性承诺**——本包公开发布，但孵化期间约定仍可自由变更。
 - **单进程、共享 checkout**——成员共享 cwd，修改立即可见；本包不提供 worktree、远端成员、merge 或文件锁。
 - **write scope 仅作提示**——Bash、formatter、代码生成器与直接外部写入可以绕过文件版本检查；Lead 必须协调 owner 并检查最终 diff。
-- **扁平且不可变的 roster**——只有 Lead 可以创建直接 teammate；不支持嵌套 Team、重命名、删除或名字复用。
+- **扁平的 Lead 专属 roster**——只有 Lead 可以创建或移除直接 teammate；不支持嵌套 Team、重命名或名字复用。
 - **不会自动释放 owner**——成员不活动、interrupt、进程退出与工作失败都不会释放任务 owner。
 - **无发送重试保证**——Team 不保留新尝试，也不对其去重；不支持多个进程同时操作一个 Team。从未到达目标的历史排队消息不会被投递。
 
