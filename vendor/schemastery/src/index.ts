@@ -788,8 +788,22 @@ Schema.extend('dict', (data, { inner, sKey }, options, strict) => {
       throw error
     }
     result[rKey] = property(data, key, inner!, options)
-    data[rKey] = data[key]
-    if (key !== rKey) delete data[key]
+    // The historical write-back normalizes the caller's input object in place,
+    // but it also crashes on immutable inputs (frozen config snapshots, e.g.
+    // cosmokit volatile references) and self-assigns even when nothing
+    // changes. Skip the no-op assignment; tolerate immutable inputs for real
+    // renames — the resolved `result` already carries the normalized key.
+    // Observed 2026-10-28: the art-director agent preset's dsh-mcp-client
+    // mount ("comfy-mcp (...): invalid config: expected union but got {...}")
+    // came from exactly this crash on a frozen env snapshot.
+    if (key !== rKey || data[rKey] !== data[key]) {
+      try {
+        data[rKey] = data[key]
+        if (key !== rKey) delete data[key]
+      } catch {
+        // Input object is immutable; normalization lives in `result` only.
+      }
+    }
   }
   return [result]
 })
@@ -831,7 +845,13 @@ Schema.extend('union', (data, { list, toString }, options, strict) => {
       messages.push(error)
     }
   }
-  throw new ValidationError(`expected ${toString()} but got ${JSON.stringify(data)}`, options)
+  // Surface the swallowed branch errors: the generic union message alone hid
+  // the real cause (e.g. a TypeError deep inside one branch) and made union
+  // config failures undiagnosable from the reported text.
+  throw new ValidationError([
+    `expected ${toString()} but got ${JSON.stringify(data)}`,
+    ...messages.map((error) => `  branch error: ${error instanceof Error ? error.message : String(error)}`),
+  ].join('\n'), options)
 })
 
 Schema.extend('intersect', (data, { list, toString }, options, strict) => {
